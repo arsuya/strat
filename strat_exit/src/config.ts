@@ -109,7 +109,8 @@ export const config = (() => {
     telegramChatId: optional("TELEGRAM_CHAT_ID", ""),
 
     rsi: {
-      length: asInt("RSI_LENGTH", 14),
+      length: asInt("RSI_LENGTH", 2),
+      smoothingLength: asInt("RSI_SMOOTHING_LENGTH", 14),
       threshold: asFloat("RSI_THRESHOLD", 90),
     },
     bb: {

@@ -12,7 +12,7 @@ import { Connection, PublicKey } from "@solana/web3.js";
 import { config } from "./config";
 import { log } from "./logger";
 import { fetchPoolOhlc15m, Candle } from "./ohlc-feed";
-import { rsi, bollingerBands, macd } from "./indicators";
+import { rsi, bollingerBands, macd, smoothing } from "./indicators";
 import { rangeStatus, closeDiscoveredPosition, RangeStatus } from "./meteora";
 import { discoverPositions, DiscoveredPosition } from "./discovery";
 import { swapAllToSol, SOL_MINT } from "./jupiter-swap";
@@ -34,7 +34,7 @@ function minBarsForIndicators(): number {
     Math.max(
       config.bb.length,
       config.macd.slow + config.macd.signal,
-      config.rsi.length + 2
+      config.rsi.length + config.rsi.smoothingLength,
     ) + 2
   );
 }
@@ -42,7 +42,8 @@ function minBarsForIndicators(): number {
 function computeIndicators(candles: Candle[]): IndicatorSnapshot | null {
   const closes = candles.map((c) => c.c);
   if (closes.length < minBarsForIndicators()) return null;
-  const rsiArr = rsi(closes, config.rsi.length);
+  const rsiRaw = rsi(closes, config.rsi.length);
+  const rsiArr = smoothing(rsiRaw, "SMA", config.rsi.smoothingLength);
   const bb = bollingerBands(closes, config.bb.length, config.bb.mult);
   const m = macd(closes, config.macd.fast, config.macd.slow, config.macd.signal);
   const last = closes.length - 1;
@@ -339,7 +340,7 @@ async function main(): Promise<void> {
   );
   log.info(`OHLC source: GeckoTerminal (15m candles)`);
   log.info(
-    `Exit: RSI(${config.rsi.length}) > ${config.rsi.threshold}, ` +
+    `Exit: RSI(${config.rsi.length}, sma${config.rsi.smoothingLength}) > ${config.rsi.threshold}, ` +
       `BB(${config.bb.length}, ${config.bb.mult}), ` +
       `MACD(${config.macd.fast},${config.macd.slow},${config.macd.signal}).`
   );
