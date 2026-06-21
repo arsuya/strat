@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+logs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+notified.json
