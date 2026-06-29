@@ -132,6 +132,8 @@ def run_gmgn(args: list[str], timeout: int = 30) -> dict | list | None:
         log.warning(f"JSON parse fail: {out[:200]}")
         return None
 
+    if isinstance(data, dict) and "completed" in data:
+        return data["completed"]
     if isinstance(data, dict) and "data" in data:
         return data["data"]
     return data
