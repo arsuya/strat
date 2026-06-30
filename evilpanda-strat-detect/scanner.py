@@ -56,8 +56,14 @@ MAX_INSIDER_RATIO     = 0.00          # Insider = 0%
 MAX_CREATOR_BAL_RATE  = 0.01          # Dev ≤ 1%
 MAX_ENTRAPMENT_RATIO  = 0.30          # Phishing ≤ 30%
 MAX_BUNDLER_RATE      = 0.60          # Bundling ≤ 60%
-MAX_RUG_RATIO         = 0.01          # Potensi rug ≤ 1%
+MAX_RUG_RATIO         = 1.0           # GMGN rug filter OFF (percaya RugCheck.xyz)
 MIN_TOTAL_FEE         = 30            # Total fee ≥ $30 (aktivitas on-chain nyata)
+
+# === RugCheck.xyz (secondary rug detection) ===
+RUGCHECK_ENABLED       = True          # Aktifkan rugcheck.xyz check
+RUGCHECK_API_KEY       = os.getenv("RUGCHECK_API_KEY", "25ecc5c9-7af5-4f3b-9a42-4602f9e59da9")
+RUGCHECK_MAX_SCORE     = 30            # score_normalised <= N -> "good" (0=safest, 100=riskiest)
+RUGCHECK_MAX_DANGER    = 0             # max "danger" level risks allowed (0 = none)
 
 # === Client-side filter (gak bisa server-side) ===
 REQUIRE_LP_BURNT      = True          # Bakar pool wajib 100%
@@ -207,6 +213,43 @@ def lp_is_burnt(item: dict) -> bool:
     if not bs:
         return True   # field kosong → anggap lolos (GMGN gak selalu populate)
     return bs == "burn"
+
+# ============================================================
+# RugCheck.xyz — secondary rug detection
+# ============================================================
+def check_rugcheck(token_addr: str) -> tuple[bool, int, list[str]]:
+    """Check token di rugcheck.xyz. Return (passed, score_normalised, risks_summary)."""
+    try:
+        r = requests.get(
+            f"https://api.rugcheck.xyz/v1/tokens/{token_addr}/report",
+            timeout=15,
+        )
+        if r.status_code != 200:
+            log.warning(f"  RugCheck API error {r.status_code} for {token_addr[:8]}...")
+            return True, 0, []  # fail open — jangan block token karena API error
+
+        data = r.json()
+        score = int(data.get("score_normalised", 0))
+        risks = data.get("risks", [])
+        rugged = data.get("rugged", False)
+
+        # Hitung danger-level risks
+        danger_risks = [r for r in risks if r.get("level") == "danger"]
+        danger_names = [r.get("name", "?") for r in danger_risks]
+
+        # Kriteria "good"
+        if rugged:
+            return False, score, ["TOKEN_RUGGED"]
+        if score > RUGCHECK_MAX_SCORE:
+            return False, score, [f"SCORE_{score}_ABOVE_{RUGCHECK_MAX_SCORE}"]
+        if len(danger_risks) > RUGCHECK_MAX_DANGER:
+            return False, score, danger_names
+
+        return True, score, []
+
+    except Exception as e:
+        log.warning(f"  RugCheck exception: {e}")
+        return True, 0, []  # fail open
 
 # ============================================================
 # GeckoTerminal OHLC + ATH check
@@ -437,7 +480,7 @@ def send_startup() -> None:
         f"• Dev ≤ {MAX_CREATOR_BAL_RATE*100:.0f}%\n"
         f"• Phishing ≤ {MAX_ENTRAPMENT_RATIO*100:.0f}%\n"
         f"• Bundling ≤ {MAX_BUNDLER_RATE*100:.0f}%\n"
-        f"• Rug ≤ {MAX_RUG_RATIO*100:.0f}%\n"
+        f"• Rug: OFF (GMGN) → RugCheck.xyz score≤{RUGCHECK_MAX_SCORE} danger≤{RUGCHECK_MAX_DANGER}\n"
         f"• Fee ≥ ${MIN_TOTAL_FEE} (aktivitas on-chain)\n"
         f"• LP burnt: wajib (skip jika unknown)\n"
         f"• ATH 3-TF: close = max di 15m/30m/1h (max {ATH_CANDLE_LIMIT} candle)\n"
@@ -506,6 +549,15 @@ def scan_once(state: dict) -> int:
         if REQUIRE_LP_BURNT and not lp_is_burnt(item):
             log.info(f"  ❌ {sym}: LP belum burnt (burn_status={item.get('burn_status')})")
             continue
+
+        # RugCheck.xyz — secondary rug detection
+        if RUGCHECK_ENABLED:
+            rc_ok, rc_score, rc_risks = check_rugcheck(addr)
+            if not rc_ok:
+                log.info(f"  ❌ {sym}: RugCheck failed — score={rc_score} risks={rc_risks}")
+                continue
+            log.info(f"  ✅ {sym}: RugCheck OK — score={rc_score}")
+
         # ATH 3-TF check — semua token diproses, gak ada batasan
         ath_checked += 1
         ath_ok, ath_status = check_ath_3tf(addr, sym)
@@ -535,10 +587,10 @@ def main() -> None:
     log.info(f"Filter: MC≥${MIN_MARKET_CAP:,} | Vol≥${MIN_VOLUME_24H:,} | Age≥{MIN_AGE} | "
              f"Top10≤{MAX_TOP_HOLDER_RATE*100:.0f}% | Insider≤{MAX_INSIDER_RATIO*100:.0f}% | "
              f"Dev≤{MAX_CREATOR_BAL_RATE*100:.0f}% | Phishing≤{MAX_ENTRAPMENT_RATIO*100:.0f}% | "
-             f"Bundling≤{MAX_BUNDLER_RATE*100:.0f}% | RugRatio≤{MAX_RUG_RATIO*100:.0f}% | "
+             f"Bundling≤{MAX_BUNDLER_RATE*100:.0f}% | RugRatio=OFF | "
              f"Fee≥${MIN_TOTAL_FEE}"
              f"{launchpad_info}")
-    log.info(f"Client-side: LP burnt={REQUIRE_LP_BURNT} | ATH 3-TF={ENABLE_ATH_CHECK}")
+    log.info(f"Client-side: LP burnt={REQUIRE_LP_BURNT} | RugCheck={RUGCHECK_ENABLED} | ATH 3-TF={ENABLE_ATH_CHECK}")
 
     if not preflight():
         return
