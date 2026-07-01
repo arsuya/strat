@@ -102,23 +102,39 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 # ============================================================
-# gmgn-cli wrapper
+# gmgn-cli wrapper — cara Blitzkrieg: panggil Node.js langsung
+#   (menghindari crash SIGABRT di PM2 yang terjadi kalau pakai
+#    CLI wrapper gmgn-cli + shell=True + env kotor)
 # ============================================================
+_GMGN_NODE   = "/home/ubuntu/.hermes/node/bin/node"
+_GMGN_SCRIPT = "/home/ubuntu/.hermes/node/lib/node_modules/gmgn-cli/dist/index.js"
+
 def run_gmgn(args: list[str], timeout: int = 30) -> dict | list | None:
-    cmd_str = " ".join([GMGN_CLI] + args + ["--raw"])
-    env = os.environ.copy()
-    if "GMGN_API_KEY" not in env:
-        env["GMGN_API_KEY"] = os.getenv("GMGN_API_KEY", "")
-    # Hapus PM2 env vars yang bikin Node.js crash
-    for k in list(env.keys()):
-        if k.startswith("PM2_") or k in ("pm_id", "NODE_APP_INSTANCE", "name", "instances", "exec_mode",
-                                          "pm_exec_path", "pm_cwd", "pm_out_log_path", "pm_err_log_path",
-                                          "pm_pid_path", "status", "unique_id", "namespace", "versioning"):
-            del env[k]
+    """Call gmgn-cli via node directly with ultra-clean environment.
+    Returns parsed JSON data (list | dict) or None on failure.
+    """
+    # Ultra-clean env — hanya PATH + HOME (no PM2 vars, no HERMES, no SSL cert override)
+    clean_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME", str(Path.home())),
+    }
+
+    # Inject GMGN_API_KEY ke env (dibutuhkan buat auth)
+    api_key = os.getenv("GMGN_API_KEY", "")
+    if api_key:
+        clean_env["GMGN_API_KEY"] = api_key
+
+    full_args = args + ["--raw"]
+
     try:
-        proc = subprocess.run(cmd_str, capture_output=True, text=True, timeout=timeout, env=env, shell=True)
+        proc = subprocess.run(
+            [_GMGN_NODE, _GMGN_SCRIPT] + full_args,
+            capture_output=True, text=True,
+            timeout=timeout,
+            env=clean_env,
+        )
     except FileNotFoundError:
-        log.error(f"`{GMGN_CLI}` tidak ketemu di PATH")
+        log.error(f"Node.js tidak ketemu di {_GMGN_NODE}")
         return None
     except subprocess.TimeoutExpired:
         log.warning(f"timeout: {' '.join(args[:4])}...")
@@ -206,6 +222,91 @@ def fetch_filtered_candidates() -> list[dict]:
     return items
 
 # ============================================================
+# STEP 1b: GMGN Trending — 24h volume leaders (cara Blitzkrieg)
+# ============================================================
+def run_gmgn_trending(limit: int = 100) -> list[dict]:
+    """Call gmgn market trending — tokens yang lagi rame trading (24h).
+
+    Fields dinormalisasi agar match format trenches, supaya downstream
+    processing (RugCheck, ATH, notif) bisa pakai field yang sama.
+    """
+    args = [
+        "market", "trending",
+        "--chain", "sol",
+        "--interval", "24h",
+        "--limit", str(limit),
+        "--order-by", "volume",
+        "--filter", "not_wash_trading",
+        "--filter", "has_social",
+        "--raw",
+    ]
+
+    clean_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME", str(Path.home())),
+    }
+
+    try:
+        proc = subprocess.run(
+            [_GMGN_NODE, _GMGN_SCRIPT] + args,
+            capture_output=True, text=True,
+            timeout=45,
+            env=clean_env,
+        )
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "")[:200]
+            log.warning(f"GMGN trending exit {proc.returncode}: {stderr}")
+            return []
+
+        data = json.loads(proc.stdout)
+        # trending wraps data in {"data": {"rank": [...]}}
+        raw_tokens = []
+        if isinstance(data, list):
+            raw_tokens = data
+        elif isinstance(data, dict):
+            inner = data.get("data", {})
+            if isinstance(inner, list):
+                raw_tokens = inner
+            elif isinstance(inner, dict):
+                raw_tokens = inner.get("rank", [])
+
+        # Normalize field names to match trenches format
+        tokens = []
+        for t in raw_tokens:
+            token = {
+                "address":            t.get("address", ""),
+                "symbol":             t.get("symbol", ""),
+                "name":               t.get("name", ""),
+                "usd_market_cap":     str(t.get("market_cap") or 0),
+                "volume_24h":         str(t.get("volume") or 0),
+                "total_fee":          str(t.get("gas_fee") or 0),
+                "top_10_holder_rate":  t.get("top_10_holder_rate"),
+                "bundler_rate":        t.get("bundler_rate"),
+                "entrapment_ratio":    t.get("entrapment_ratio"),
+                "rug_ratio":           t.get("rug_ratio"),
+                "open_timestamp":      t.get("open_timestamp"),
+                "creation_timestamp":  t.get("creation_timestamp"),
+                "pool_address":        t.get("launch_quote_address", ""),
+                "launchpad":           t.get("launchpad", ""),
+                "holder_count":        t.get("holder_count"),
+                "_from_trending":      True,   # marker for merge priority
+            }
+            tokens.append(token)
+
+        log.info(f"GMGN trending: {len(tokens)} tokens (24h)")
+        return tokens
+
+    except subprocess.TimeoutExpired:
+        log.warning("GMGN trending TIMEOUT (45s)")
+        return []
+    except json.JSONDecodeError as e:
+        log.warning(f"GMGN trending JSON parse error: {e}")
+        return []
+    except Exception as e:
+        log.warning(f"GMGN trending exception: {e}")
+        return []
+
+# ============================================================
 # STEP 2: cek LP burn (client-side, dari response field)
 # ============================================================
 def lp_is_burnt(item: dict) -> bool:
@@ -250,6 +351,48 @@ def check_rugcheck(token_addr: str) -> tuple[bool, int, list[str]]:
     except Exception as e:
         log.warning(f"  RugCheck exception: {e}")
         return True, 0, []  # fail open
+
+# ============================================================
+# STEP 2b: DexScreener cross-check — verifikasi MC + V24h
+# ============================================================
+DS_BASE = "https://api.dexscreener.com"
+
+def fetch_token_pairs(token_addr: str) -> list[dict]:
+    """Fetch all DEX pairs for a token from DexScreener. Sorted by liquidity desc."""
+    try:
+        r = requests.get(
+            f"{DS_BASE}/latest/dex/tokens/{token_addr}",
+            headers={"accept": "application/json"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        pairs = data.get("pairs") or []
+        # solana only, sorted by liquidity desc
+        sol_pairs = [p for p in pairs if (p.get("chainId") or "").lower() == "solana"]
+        sol_pairs.sort(key=lambda p: (p.get("liquidity") or {}).get("usd") or 0, reverse=True)
+        return sol_pairs
+    except Exception as e:
+        log.warning(f"DS token-pairs exception ({token_addr[:8]}): {e}")
+        return []
+
+def passes_dexscreener_filter(pair: dict) -> tuple[bool, str]:
+    """Cross-check: DexScreener MC + V24h harus ≥ threshold.
+    Returns (ok, reason_if_fail). Fail-open kalau pair kosong (data unavailable).
+    """
+    if not pair:
+        return True, "no DS data (fail-open)"
+
+    mc = float(pair.get("marketCap") or pair.get("fdv") or 0)
+    if mc < MIN_MARKET_CAP:
+        return False, f"DS MC ${mc:,.0f} < ${MIN_MARKET_CAP:,}"
+
+    v24 = float((pair.get("volume") or {}).get("h24") or 0)
+    if v24 < MIN_VOLUME_24H:
+        return False, f"DS V24h ${v24:,.0f} < ${MIN_VOLUME_24H:,}"
+
+    return True, ""
 
 # ============================================================
 # GeckoTerminal OHLC + ATH check
@@ -493,12 +636,15 @@ def send_startup() -> None:
 # ============================================================
 def preflight() -> bool:
     ok = True
-    if not shutil.which(GMGN_CLI):
-        log.error(f"❌ `{GMGN_CLI}` tidak di PATH. Install: npm i -g gmgn-cli")
+    if not Path(_GMGN_NODE).exists():
+        log.error(f"❌ Node.js tidak ditemukan di {_GMGN_NODE}")
+        ok = False
+    elif not Path(_GMGN_SCRIPT).exists():
+        log.error(f"❌ gmgn-cli script tidak ditemukan di {_GMGN_SCRIPT}")
         ok = False
 
-    # Skip trending test — kadang gagal di PM2 tapi trenches works fine
-    log.info("✅ gmgn-cli found, skip preflight trending test")
+    # Skip trending test — sekarang panggil node langsung (cara Blitzkrieg), no crash
+    log.info("✅ Node.js + gmgn-cli script found (direct call, cara Blitzkrieg)")
     log.info(f"   GMGN_API_KEY loaded: {'YES' if os.getenv('GMGN_API_KEY') else 'NO'}")
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -512,12 +658,35 @@ def preflight() -> bool:
 # MAIN LOOP
 # ============================================================
 def scan_once(state: dict) -> int:
-    """Return jumlah token baru yang lolos & dinotifikasi di scan ini."""
-    candidates = fetch_filtered_candidates()
+    """Single scan cycle: GMGN trenches + trending → LP → RugCheck → ATH → notify."""
+    # Step 1a: GMGN trenches (server-side filtered)
+    trenches = fetch_filtered_candidates()
+
+    # Step 1b: GMGN trending (24h volume leaders — no server-side filter)
+    trending = run_gmgn_trending(limit=100)
+
+    # Merge & deduplicate by address. Trenches takes priority.
+    seen_addrs: set[str] = set()
+    candidates: list[dict] = []
+    for t in trenches:
+        addr = t.get("address", "")
+        if addr and addr not in seen_addrs:
+            seen_addrs.add(addr)
+            candidates.append(t)
+    for t in trending:
+        addr = t.get("address", "")
+        if addr and addr not in seen_addrs:
+            seen_addrs.add(addr)
+            candidates.append(t)
+
     if not candidates:
-        log.info("Scan: 0 kandidat lolos filter server-side.")
+        log.info("Scan: 0 kandidat dari GMGN trenches + trending.")
         return 0
-    log.info(f"Scan: {len(candidates)} kandidat, proses SEMUA untuk ATH check")
+
+    trench_count = sum(1 for t in candidates if not t.get("_from_trending"))
+    trend_count = len(candidates) - trench_count
+    log.info(f"Scan: {len(candidates)} kandidat ({trench_count} trenches + {trend_count} trending) — proses ATH check")
+
     passed = 0
     ath_checked = 0
 
@@ -529,6 +698,24 @@ def scan_once(state: dict) -> int:
     for idx, item in enumerate(candidates):
         addr = item.get("address")
         if not addr:
+            continue
+
+        sym = item.get("symbol") or addr[:8]
+        is_trending = item.get("_from_trending", False)
+
+        # Client-side guard untuk trending (trending gak ada server-side filter)
+        mc = float(item.get("usd_market_cap") or 0)
+        v24 = float(item.get("volume_24h") or 0)
+        fee = float(item.get("total_fee") or 0)
+
+        if mc < MIN_MARKET_CAP:
+            log.info(f"  ❌ {sym}: MC ${mc:,.0f} < ${MIN_MARKET_CAP:,} [{'trending' if is_trending else 'trenches'}]")
+            continue
+        if v24 < MIN_VOLUME_24H:
+            log.info(f"  ❌ {sym}: V24h ${v24:,.0f} < ${MIN_VOLUME_24H:,} [{'trending' if is_trending else 'trenches'}]")
+            continue
+        if fee < MIN_TOTAL_FEE:
+            log.info(f"  ❌ {sym}: Fee ${fee:,.0f} < ${MIN_TOTAL_FEE} [{'trending' if is_trending else 'trenches'}]")
             continue
 
         # Dedup time-based: skip kalau terakhir dinotif < RE_NOTIFY_HOURS jam lalu
@@ -543,12 +730,20 @@ def scan_once(state: dict) -> int:
                 except ValueError:
                     pass  # timestamp corrupt → reprocess
 
-        sym = item.get("symbol") or addr[:8]
-
-        # Client-side: LP burnt
+        # Client-side: LP burnt — DISABLED (GMGN burn_status unreliable)
         if REQUIRE_LP_BURNT and not lp_is_burnt(item):
-            log.info(f"  ❌ {sym}: LP belum burnt (burn_status={item.get('burn_status')})")
             continue
+
+        # DexScreener cross-check — verifikasi independen MC + V24h
+        ds_pairs = fetch_token_pairs(addr)
+        ds_pair = ds_pairs[0] if ds_pairs else {}
+        ds_ok, ds_reason = passes_dexscreener_filter(ds_pair)
+        if not ds_ok:
+            log.info(f"  ❌ {sym}: DexScreener cross-check failed — {ds_reason}")
+            continue
+        ds_mc = float(ds_pair.get("marketCap") or ds_pair.get("fdv") or 0)
+        ds_v24 = float((ds_pair.get("volume") or {}).get("h24") or 0)
+        log.info(f"  ✅ {sym}: DexScreener OK (DS MC=${ds_mc:,.0f}, DS V24h=${ds_v24:,.0f})")
 
         # RugCheck.xyz — secondary rug detection
         if RUGCHECK_ENABLED:
@@ -574,11 +769,11 @@ def scan_once(state: dict) -> int:
         }
         save_state(state)
         passed += 1
-        log.info(f"  ✅ {sym}: LOLOS — notif terkirim")
+        log.info(f"  ✅ {sym}: LOLOS — notif terkirim [{'trending' if is_trending else 'trenches'}]")
 
         time.sleep(0.3)  # rate limit safety
 
-    log.info(f"Scan selesai. {passed} token baru lolos.")
+    log.info(f"Scan selesai. {passed} token baru lolos (dari {ath_checked} ATH-check).")
     return passed
 
 def main() -> None:
@@ -590,7 +785,7 @@ def main() -> None:
              f"Bundling≤{MAX_BUNDLER_RATE*100:.0f}% | RugRatio=OFF | "
              f"Fee≥${MIN_TOTAL_FEE}"
              f"{launchpad_info}")
-    log.info(f"Client-side: LP burnt={REQUIRE_LP_BURNT} | RugCheck={RUGCHECK_ENABLED} | ATH 3-TF={ENABLE_ATH_CHECK}")
+    log.info(f"Client-side: LP burnt=DISABLED | RugCheck={RUGCHECK_ENABLED} | ATH 3-TF={ENABLE_ATH_CHECK}")
 
     if not preflight():
         return
